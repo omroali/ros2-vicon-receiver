@@ -47,7 +47,7 @@ def generate_launch_description():
         description='Whether RPY values are in degrees (true) or radians (false)'
     )
 
-    # Publish mode arguments
+    # Publish mode arguments - ALL data types enabled by default
     publish_segments_arg = DeclareLaunchArgument(
         'publish_segments',
         default_value='true',
@@ -55,12 +55,12 @@ def generate_launch_description():
     )
     publish_markers_arg = DeclareLaunchArgument(
         'publish_markers',
-        default_value='false',
+        default_value='true',
         description='Enable publishing labeled marker position data (PointStamped)'
     )
     publish_unlabeled_markers_arg = DeclareLaunchArgument(
         'publish_unlabeled_markers',
-        default_value='false',
+        default_value='true',
         description='Enable publishing unlabeled marker position data (PointStamped)'
     )
 

@@ -14,6 +14,14 @@ Communicator::Communicator() : Node("vicon_client")
     this->declare_parameter<std::vector<double>>("map_xyz",  {0.0, 0.0, 0.0});
     this->declare_parameter<std::vector<double>>("map_rpy",  {0.0, 0.0, 0.0});
     this->declare_parameter<bool>("map_rpy_in_degrees", false);
+    
+    // Declare parameters for publish modes
+    this->declare_parameter<bool>("publish_segments", true);
+    this->declare_parameter<bool>("publish_markers", false);
+    this->declare_parameter<bool>("publish_unlabeled_markers", false);
+    
+    // Declare parameter for marker visualization size (in meters)
+    this->declare_parameter<double>("marker_size", 0.02);
 
     // Retrieve parameters values
     this->get_parameter("hostname", hostname);
@@ -25,6 +33,14 @@ Communicator::Communicator() : Node("vicon_client")
     this->get_parameter("map_xyz", map_xyz);
     this->get_parameter("map_rpy", map_rpy);
     this->get_parameter("map_rpy_in_degrees", map_rpy_in_degrees);
+    
+    // Retrieve publish mode parameters
+    this->get_parameter("publish_segments", publish_segments);
+    this->get_parameter("publish_markers", publish_markers);
+    this->get_parameter("publish_unlabeled_markers", publish_unlabeled_markers);
+    
+    // Retrieve marker visualization size
+    this->get_parameter("marker_size", marker_size);
 
     // Publish static transform from map to vicon origin
     if (map_rpy_in_degrees) {
@@ -37,6 +53,25 @@ Communicator::Communicator() : Node("vicon_client")
 
     // Initialize the tf2 broadcaster
     tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
+    
+    // Create MarkerArray publishers for RViz2 visualization
+    if (publish_markers) {
+        labeled_markers_viz_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+            ns_name + "/markers_visualization", 10);
+        cout << "Created MarkerArray publisher for labeled markers visualization" << endl;
+    }
+    
+    if (publish_unlabeled_markers) {
+        unlabeled_markers_viz_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+            ns_name + "/unlabeled_markers_visualization", 10);
+        cout << "Created MarkerArray publisher for unlabeled markers visualization" << endl;
+    }
+    
+    // Log publish modes
+    cout << "Publish modes - Segments: " << (publish_segments ? "ON" : "OFF")
+         << ", Markers: " << (publish_markers ? "ON" : "OFF")
+         << ", Unlabeled Markers: " << (publish_unlabeled_markers ? "ON" : "OFF") << endl;
+    cout << "Marker visualization size: " << marker_size << " meters" << endl;
 }
 
 // Publish the static transform from map to vicon origin
@@ -152,6 +187,23 @@ void Communicator::get_frame()
     vicon_client.GetFrame();
     Output_GetFrameNumber frame_number = vicon_client.GetFrameNumber();
 
+    // Process data based on publish modes
+    if (publish_segments) {
+        process_segments();
+    }
+    
+    if (publish_markers) {
+        process_markers();
+    }
+    
+    if (publish_unlabeled_markers) {
+        process_unlabeled_markers();
+    }
+}
+
+// Process segment data from Vicon server
+void Communicator::process_segments()
+{
     // Get the number of subjects in the frame
     unsigned int subject_count = vicon_client.GetSubjectCount().SubjectCount;
 
@@ -200,12 +252,12 @@ void Communicator::get_frame()
             tf_msg.transform.rotation.w = quat.Rotation[3];
 
             // Publish the position data
-            boost::mutex::scoped_try_lock lock(mutex);
+            boost::mutex::scoped_try_lock lock(segment_mutex);
             if (lock.owns_lock())
             {
                 // Check if a publisher exists for the segment
-                pub_it = pub_map.find(subject_name + "/" + segment_name);
-                if (pub_it != pub_map.end())
+                pub_it = segment_pub_map.find(subject_name + "/" + segment_name);
+                if (pub_it != segment_pub_map.end())
                 {
                     Publisher & pub = pub_it->second;
 
@@ -224,7 +276,7 @@ void Communicator::get_frame()
 
                         // Orientation: copy the quaternion (x, y, z, w) directly from the transform.
                         vicon_pose_msg.pose.orientation = tf_msg.transform.rotation;
-                        
+
                         // Update timestamp of static transform
                         static_tf.header.stamp = tf_msg.header.stamp;
 
@@ -240,11 +292,11 @@ void Communicator::get_frame()
                 {
                     // Create a publisher if it doesn't exist, de-duplicating concurrent attempts
                     std::string key = subject_name + "/" + segment_name;
-                    if (pending_publishers.find(key) == pending_publishers.end())
+                    if (pending_segment_publishers.find(key) == pending_segment_publishers.end())
                     {
-                        pending_publishers.insert(key);
+                        pending_segment_publishers.insert(key);
                         lock.unlock();
-                        create_publisher(subject_name, segment_name);
+                        create_segment_publisher(subject_name, segment_name);
                     }
                     else
                     {
@@ -256,23 +308,331 @@ void Communicator::get_frame()
 
             // Broadcast the transform
             tf_broadcaster_->sendTransform(tf_msg);
-
         }
     }
 }
 
-// Create a publisher for a specific subject and segment
-void Communicator::create_publisher(const string subject_name, const string segment_name)
+// Process labeled marker data from Vicon server
+void Communicator::process_markers()
 {
-    // Launch a thread to create the publisher
-    boost::thread(&Communicator::create_publisher_thread, this, subject_name, segment_name);
+    // Get the number of subjects in the frame
+    unsigned int subject_count = vicon_client.GetSubjectCount().SubjectCount;
+
+    map<string, PointPublisher>::iterator pub_it;
+    
+    // Create MarkerArray for visualization
+    visualization_msgs::msg::MarkerArray marker_array;
+    int marker_id = 0;
+    auto now = this->get_clock()->now();
+
+    // Iterate through each subject
+    for (unsigned int subject_index = 0; subject_index < subject_count; ++subject_index)
+    {
+        // Get the subject name
+        string subject_name = vicon_client.GetSubjectName(subject_index).SubjectName;
+
+        // Get the number of markers for the subject
+        unsigned int marker_count = vicon_client.GetMarkerCount(subject_name).MarkerCount;
+
+        // Iterate through each marker
+        for (unsigned int marker_index = 0; marker_index < marker_count; ++marker_index)
+        {
+            // Get the marker name
+            string marker_name = vicon_client.GetMarkerName(subject_name, marker_index).MarkerName;
+
+            // Retrieve the marker's global position
+            Output_GetMarkerGlobalTranslation trans =
+                vicon_client.GetMarkerGlobalTranslation(subject_name, marker_name);
+
+            // Skip occluded markers
+            if (trans.Occluded)
+            {
+                continue;
+            }
+
+            // Convert position from mm to meters
+            double x = trans.Translation[0] / 1000.0;
+            double y = trans.Translation[1] / 1000.0;
+            double z = trans.Translation[2] / 1000.0;
+
+            // Build a TF message for this marker
+            geometry_msgs::msg::TransformStamped tf_msg;
+            tf_msg.header.stamp = now;
+            tf_msg.header.frame_id = vicon_frame;
+            tf_msg.child_frame_id = subject_name + "_marker_" + marker_name;
+
+            tf_msg.transform.translation.x = x;
+            tf_msg.transform.translation.y = y;
+            tf_msg.transform.translation.z = z;
+
+            // Markers don't have rotation, use identity quaternion
+            tf_msg.transform.rotation.x = 0.0;
+            tf_msg.transform.rotation.y = 0.0;
+            tf_msg.transform.rotation.z = 0.0;
+            tf_msg.transform.rotation.w = 1.0;
+            
+            // Add sphere marker for visualization
+            visualization_msgs::msg::Marker sphere_marker;
+            sphere_marker.header.frame_id = vicon_frame;
+            sphere_marker.header.stamp = now;
+            sphere_marker.ns = subject_name;
+            sphere_marker.id = marker_id;
+            sphere_marker.type = visualization_msgs::msg::Marker::SPHERE;
+            sphere_marker.action = visualization_msgs::msg::Marker::ADD;
+            sphere_marker.pose.position.x = x;
+            sphere_marker.pose.position.y = y;
+            sphere_marker.pose.position.z = z;
+            sphere_marker.pose.orientation.w = 1.0;
+            sphere_marker.scale.x = marker_size;
+            sphere_marker.scale.y = marker_size;
+            sphere_marker.scale.z = marker_size;
+            // Green color for labeled markers
+            sphere_marker.color.r = 0.0f;
+            sphere_marker.color.g = 1.0f;
+            sphere_marker.color.b = 0.0f;
+            sphere_marker.color.a = 1.0f;
+            sphere_marker.lifetime = rclcpp::Duration::from_seconds(0.1);
+            marker_array.markers.push_back(sphere_marker);
+            
+            // Add text marker for the label
+            visualization_msgs::msg::Marker text_marker;
+            text_marker.header.frame_id = vicon_frame;
+            text_marker.header.stamp = now;
+            text_marker.ns = subject_name + "_labels";
+            text_marker.id = marker_id;
+            text_marker.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+            text_marker.action = visualization_msgs::msg::Marker::ADD;
+            text_marker.pose.position.x = x;
+            text_marker.pose.position.y = y;
+            text_marker.pose.position.z = z + marker_size + 0.01; // Slightly above the sphere
+            text_marker.pose.orientation.w = 1.0;
+            text_marker.scale.z = marker_size * 1.5; // Text height
+            text_marker.color.r = 1.0f;
+            text_marker.color.g = 1.0f;
+            text_marker.color.b = 1.0f;
+            text_marker.color.a = 1.0f;
+            text_marker.text = marker_name;
+            text_marker.lifetime = rclcpp::Duration::from_seconds(0.1);
+            marker_array.markers.push_back(text_marker);
+            
+            marker_id++;
+
+            // Publish the position data to individual topics
+            boost::mutex::scoped_try_lock lock(marker_mutex);
+            if (lock.owns_lock())
+            {
+                // Check if a publisher exists for the marker
+                pub_it = marker_pub_map.find(subject_name + "/" + marker_name);
+                if (pub_it != marker_pub_map.end())
+                {
+                    PointPublisher & pub = pub_it->second;
+
+                    if (pub.is_ready)
+                    {
+                        // Build a PointStamped in the Vicon frame
+                        geometry_msgs::msg::PointStamped vicon_point_msg;
+                        vicon_point_msg.header.stamp = now;
+                        vicon_point_msg.header.frame_id = vicon_frame;
+
+                        vicon_point_msg.point.x = x;
+                        vicon_point_msg.point.y = y;
+                        vicon_point_msg.point.z = z;
+
+                        // Update timestamp of static transform
+                        static_tf.header.stamp = now;
+
+                        // Transform the point to the global frame
+                        geometry_msgs::msg::PointStamped global_point_msg;
+                        tf2::doTransform(vicon_point_msg, global_point_msg, static_tf);
+
+                        // Publish the transformed point
+                        pub.publish(global_point_msg);
+                    }
+                }
+                else
+                {
+                    // Create a publisher if it doesn't exist, de-duplicating concurrent attempts
+                    std::string key = subject_name + "/" + marker_name;
+                    if (pending_marker_publishers.find(key) == pending_marker_publishers.end())
+                    {
+                        pending_marker_publishers.insert(key);
+                        lock.unlock();
+                        create_marker_publisher(subject_name, marker_name);
+                    }
+                    else
+                    {
+                        // Another thread is already creating this publisher
+                        lock.unlock();
+                    }
+                }
+            }
+
+            // Broadcast the transform
+            tf_broadcaster_->sendTransform(tf_msg);
+        }
+    }
+    
+    // Publish the MarkerArray for visualization
+    if (!marker_array.markers.empty() && labeled_markers_viz_pub_) {
+        labeled_markers_viz_pub_->publish(marker_array);
+    }
 }
 
-// Thread function to create a publisher
-void Communicator::create_publisher_thread(const string subject_name, const string segment_name)
+// Process unlabeled marker data from Vicon server
+void Communicator::process_unlabeled_markers()
+{
+    // Get the number of unlabeled markers
+    unsigned int unlabeled_marker_count = vicon_client.GetUnlabeledMarkerCount().MarkerCount;
+
+    map<unsigned int, PointPublisher>::iterator pub_it;
+    
+    // Create MarkerArray for visualization
+    visualization_msgs::msg::MarkerArray marker_array;
+    auto now = this->get_clock()->now();
+
+    // Iterate through each unlabeled marker
+    for (unsigned int marker_index = 0; marker_index < unlabeled_marker_count; ++marker_index)
+    {
+        // Retrieve the unlabeled marker's global position
+        Output_GetUnlabeledMarkerGlobalTranslation trans =
+            vicon_client.GetUnlabeledMarkerGlobalTranslation(marker_index);
+
+        // Convert position from mm to meters
+        double x = trans.Translation[0] / 1000.0;
+        double y = trans.Translation[1] / 1000.0;
+        double z = trans.Translation[2] / 1000.0;
+
+        // Build a TF message for this unlabeled marker
+        geometry_msgs::msg::TransformStamped tf_msg;
+        tf_msg.header.stamp = now;
+        tf_msg.header.frame_id = vicon_frame;
+        tf_msg.child_frame_id = "unlabeled_marker_" + std::to_string(marker_index);
+
+        tf_msg.transform.translation.x = x;
+        tf_msg.transform.translation.y = y;
+        tf_msg.transform.translation.z = z;
+
+        // Markers don't have rotation, use identity quaternion
+        tf_msg.transform.rotation.x = 0.0;
+        tf_msg.transform.rotation.y = 0.0;
+        tf_msg.transform.rotation.z = 0.0;
+        tf_msg.transform.rotation.w = 1.0;
+        
+        // Add sphere marker for visualization
+        visualization_msgs::msg::Marker sphere_marker;
+        sphere_marker.header.frame_id = vicon_frame;
+        sphere_marker.header.stamp = now;
+        sphere_marker.ns = "unlabeled";
+        sphere_marker.id = marker_index;
+        sphere_marker.type = visualization_msgs::msg::Marker::SPHERE;
+        sphere_marker.action = visualization_msgs::msg::Marker::ADD;
+        sphere_marker.pose.position.x = x;
+        sphere_marker.pose.position.y = y;
+        sphere_marker.pose.position.z = z;
+        sphere_marker.pose.orientation.w = 1.0;
+        sphere_marker.scale.x = marker_size;
+        sphere_marker.scale.y = marker_size;
+        sphere_marker.scale.z = marker_size;
+        // Orange color for unlabeled markers
+        sphere_marker.color.r = 1.0f;
+        sphere_marker.color.g = 0.5f;
+        sphere_marker.color.b = 0.0f;
+        sphere_marker.color.a = 1.0f;
+        sphere_marker.lifetime = rclcpp::Duration::from_seconds(0.1);
+        marker_array.markers.push_back(sphere_marker);
+        
+        // Add text marker for the index label
+        visualization_msgs::msg::Marker text_marker;
+        text_marker.header.frame_id = vicon_frame;
+        text_marker.header.stamp = now;
+        text_marker.ns = "unlabeled_labels";
+        text_marker.id = marker_index;
+        text_marker.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+        text_marker.action = visualization_msgs::msg::Marker::ADD;
+        text_marker.pose.position.x = x;
+        text_marker.pose.position.y = y;
+        text_marker.pose.position.z = z + marker_size + 0.01; // Slightly above the sphere
+        text_marker.pose.orientation.w = 1.0;
+        text_marker.scale.z = marker_size * 1.5; // Text height
+        text_marker.color.r = 1.0f;
+        text_marker.color.g = 1.0f;
+        text_marker.color.b = 1.0f;
+        text_marker.color.a = 1.0f;
+        text_marker.text = "unlabeled_" + std::to_string(marker_index);
+        text_marker.lifetime = rclcpp::Duration::from_seconds(0.1);
+        marker_array.markers.push_back(text_marker);
+
+        // Publish the position data to individual topics
+        boost::mutex::scoped_try_lock lock(unlabeled_marker_mutex);
+        if (lock.owns_lock())
+        {
+            // Check if a publisher exists for this unlabeled marker
+            pub_it = unlabeled_marker_pub_map.find(marker_index);
+            if (pub_it != unlabeled_marker_pub_map.end())
+            {
+                PointPublisher & pub = pub_it->second;
+
+                if (pub.is_ready)
+                {
+                    // Build a PointStamped in the Vicon frame
+                    geometry_msgs::msg::PointStamped vicon_point_msg;
+                    vicon_point_msg.header.stamp = now;
+                    vicon_point_msg.header.frame_id = vicon_frame;
+
+                    vicon_point_msg.point.x = x;
+                    vicon_point_msg.point.y = y;
+                    vicon_point_msg.point.z = z;
+
+                    // Update timestamp of static transform
+                    static_tf.header.stamp = now;
+
+                    // Transform the point to the global frame
+                    geometry_msgs::msg::PointStamped global_point_msg;
+                    tf2::doTransform(vicon_point_msg, global_point_msg, static_tf);
+
+                    // Publish the transformed point
+                    pub.publish(global_point_msg);
+                }
+            }
+            else
+            {
+                // Create a publisher if it doesn't exist, de-duplicating concurrent attempts
+                if (pending_unlabeled_marker_publishers.find(marker_index) == pending_unlabeled_marker_publishers.end())
+                {
+                    pending_unlabeled_marker_publishers.insert(marker_index);
+                    lock.unlock();
+                    create_unlabeled_marker_publisher(marker_index);
+                }
+                else
+                {
+                    // Another thread is already creating this publisher
+                    lock.unlock();
+                }
+            }
+        }
+
+        // Broadcast the transform
+        tf_broadcaster_->sendTransform(tf_msg);
+    }
+    
+    // Publish the MarkerArray for visualization
+    if (!marker_array.markers.empty() && unlabeled_markers_viz_pub_) {
+        unlabeled_markers_viz_pub_->publish(marker_array);
+    }
+}
+
+// Create a publisher for a specific subject and segment
+void Communicator::create_segment_publisher(const string subject_name, const string segment_name)
+{
+    // Launch a thread to create the publisher
+    boost::thread(&Communicator::create_segment_publisher_thread, this, subject_name, segment_name);
+}
+
+// Thread function to create a segment publisher
+void Communicator::create_segment_publisher_thread(const string subject_name, const string segment_name)
 {
     // Construct the topic name and key
-    std::string topic_name = ns_name + "/" + subject_name + "/" + segment_name;
+    std::string topic_name = ns_name + "/segments/" + subject_name + "/" + segment_name;
     std::string key = subject_name + "/" + segment_name;
 
     // Log publisher creation
@@ -280,9 +640,58 @@ void Communicator::create_publisher_thread(const string subject_name, const stri
     cout << msg << endl;
 
     // Create and store the publisher; then clear the pending flag
-    boost::mutex::scoped_lock lock(mutex);
-    pub_map.insert(std::map<std::string, Publisher>::value_type(key, Publisher(topic_name, this)));
-    pending_publishers.erase(key);
+    boost::mutex::scoped_lock lock(segment_mutex);
+    segment_pub_map.insert(std::map<std::string, Publisher>::value_type(key, Publisher(topic_name, this)));
+    pending_segment_publishers.erase(key);
+    lock.unlock();
+}
+
+// Create a publisher for a specific subject and marker
+void Communicator::create_marker_publisher(const string subject_name, const string marker_name)
+{
+    // Launch a thread to create the publisher
+    boost::thread(&Communicator::create_marker_publisher_thread, this, subject_name, marker_name);
+}
+
+// Thread function to create a marker publisher
+void Communicator::create_marker_publisher_thread(const string subject_name, const string marker_name)
+{
+    // Construct the topic name and key
+    std::string topic_name = ns_name + "/markers/" + subject_name + "/" + marker_name;
+    std::string key = subject_name + "/" + marker_name;
+
+    // Log publisher creation
+    string msg = "Creating publisher for marker " + marker_name + " from subject " + subject_name;
+    cout << msg << endl;
+
+    // Create and store the publisher; then clear the pending flag
+    boost::mutex::scoped_lock lock(marker_mutex);
+    marker_pub_map.insert(std::map<std::string, PointPublisher>::value_type(key, PointPublisher(topic_name, this)));
+    pending_marker_publishers.erase(key);
+    lock.unlock();
+}
+
+// Create a publisher for an unlabeled marker
+void Communicator::create_unlabeled_marker_publisher(const unsigned int marker_index)
+{
+    // Launch a thread to create the publisher
+    boost::thread(&Communicator::create_unlabeled_marker_publisher_thread, this, marker_index);
+}
+
+// Thread function to create an unlabeled marker publisher
+void Communicator::create_unlabeled_marker_publisher_thread(const unsigned int marker_index)
+{
+    // Construct the topic name (prefix with 'marker_' to avoid starting with a number)
+    std::string topic_name = ns_name + "/unlabeled_markers/marker_" + std::to_string(marker_index);
+
+    // Log publisher creation
+    string msg = "Creating publisher for unlabeled marker " + std::to_string(marker_index);
+    cout << msg << endl;
+
+    // Create and store the publisher; then clear the pending flag
+    boost::mutex::scoped_lock lock(unlabeled_marker_mutex);
+    unlabeled_marker_pub_map.insert(std::map<unsigned int, PointPublisher>::value_type(marker_index, PointPublisher(topic_name, this)));
+    pending_unlabeled_marker_publishers.erase(marker_index);
     lock.unlock();
 }
 

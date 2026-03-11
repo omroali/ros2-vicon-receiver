@@ -15,6 +15,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
 
 # detect arch
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
@@ -111,9 +112,10 @@ target_link_libraries(vicon_client
   Boost::system Boost::thread Boost::chrono Boost::timer
 )
 
-ament_target_dependencies(vicon_client 
+ament_target_dependencies(vicon_client
   rclcpp
   geometry_msgs
+  visualization_msgs
   tf2
   tf2_ros
   tf2_geometry_msgs
@@ -135,7 +137,7 @@ install(FILES
   DESTINATION ${CMAKE_INSTALL_LIBDIR})
 
 # install the SDK shared lib into install/lib
-install(FILES "${VICON_SDK_LIB}" 
+install(FILES "${VICON_SDK_LIB}"
         DESTINATION ${CMAKE_INSTALL_LIBDIR})
 
 # install SDK headers into install/include (keeps vendor tree)
@@ -147,7 +149,7 @@ install(DIRECTORY include/
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 # install the node and launch files
-install(TARGETS vicon_client RUNTIME 
+install(TARGETS vicon_client RUNTIME
         DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch
