@@ -8,7 +8,7 @@ def generate_launch_description():
     # Declare launch arguments
     hostname_arg = DeclareLaunchArgument(
         'hostname',
-        default_value='10.10.10.2',
+        default_value='192.168.10.1',
         description='Vicon server hostname or IP address'
     )
     buffer_size_arg = DeclareLaunchArgument(
