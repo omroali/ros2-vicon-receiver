@@ -230,6 +230,12 @@ void Communicator::process_segments()
             Output_GetSegmentGlobalRotationQuaternion quat =
                 vicon_client.GetSegmentGlobalRotationQuaternion(subject_name, segment_name);
 
+            // Skip occluded segments (markers not visible to Vicon cameras)
+            if (trans.Occluded || quat.Occluded)
+            {
+                continue;
+            }
+
             // Build a TF message for this segment
             geometry_msgs::msg::TransformStamped tf_msg;
 
